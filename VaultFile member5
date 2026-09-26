@@ -1,0 +1,189 @@
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+
+
+
+public class VaultFile {
+
+
+    private String filePath;
+
+   
+    private String formatMarker;
+
+    private byte[] salt;
+
+    private byte[] iv;
+
+    private byte[] encryptedData;
+
+    private CryptoService cryptoService;
+
+    public static final String DEFAULT_FORMAT_MARKER = "PVLT1";
+
+    // ------------------------------------------------------------------
+    // Constructors
+    // ------------------------------------------------------------------
+
+    /**
+     * Creates a VaultFile bound to the given path.
+     *
+     * @param filePath      the file to save/load
+     * @param cryptoService the crypto service used for encryption/decryption
+     */
+    public VaultFile(String filePath, CryptoService cryptoService) {
+        this.filePath = filePath;
+        this.cryptoService = cryptoService;
+        this.formatMarker = DEFAULT_FORMAT_MARKER;
+        this.salt = null;
+        this.iv = null;
+        this.encryptedData = null;
+    }
+
+    /** Convenience constructor using the default vault path. */
+    public VaultFile(CryptoService cryptoService) {
+        this("vault.dat", cryptoService);
+    }
+
+    public void saveVault(VaultData vaultData, String masterPassword) throws Exception {
+
+        byte[] plainBytes = serializeVaultData(vaultData);
+
+        this.salt = cryptoService.generateSalt();
+        this.iv = cryptoService.generateIv();
+
+        byte[] key = cryptoService.deriveKey(masterPassword.toCharArray(), this.salt);
+
+        this.encryptedData = cryptoService.encrypt(plainBytes, key, this.iv);
+
+        writeVaultFile();
+
+        Arrays.fill(plainBytes, (byte) 0);
+        Arrays.fill(key, (byte) 0);
+    }
+
+    public VaultData loadVault(String masterPassword) throws Exception {
+        if (!exists()) {
+            throw new FileNotFoundException("Vault file not found: " + filePath);
+        }
+
+        readVaultFile();
+
+        byte[] key = cryptoService.deriveKey(masterPassword.toCharArray(), this.salt);
+
+  
+        byte[] plainBytes;
+        try {
+            plainBytes = cryptoService.decrypt(this.encryptedData, key, this.iv);
+        } catch (Exception e) {
+            Arrays.fill(key, (byte) 0);
+            throw new IOException("Incorrect master password or corrupted vault file.", e);
+        }
+
+        // 4. Deserialize
+        VaultData data = deserializeVaultData(plainBytes);
+
+        // 5. Clear sensitive data
+        Arrays.fill(key, (byte) 0);
+        Arrays.fill(plainBytes, (byte) 0);
+
+        return data;
+    }
+
+
+    public boolean exists() {
+        File f = new File(filePath);
+        return f.exists() && f.isFile();
+    }
+
+    /** Deletes the vault file if it exists (used for "reset vault"). */
+    public void delete() {
+        File f = new File(filePath);
+        if (f.exists()) {
+            f.delete();
+        }
+    }
+
+    public String getFilePath()      { return filePath; }
+    public String getFormatMarker()  { return formatMarker; }
+    public byte[] getSalt()          { return salt; }
+    public byte[] getIv()            { return iv; }
+    public byte[] getEncryptedData() { return encryptedData; }
+
+    private void writeVaultFile() throws IOException {
+        try (DataOutputStream out = new DataOutputStream(
+                new BufferedOutputStream(new FileOutputStream(filePath)))) {
+
+            // Format marker (fixed size, ASCII)
+            out.write(formatMarker.getBytes(StandardCharsets.US_ASCII));
+
+            // Length-prefixed salt, IV, encrypted data
+            writeByteArray(out, salt);
+            writeByteArray(out, iv);
+            writeByteArray(out, encryptedData);
+        }
+    }
+
+
+    private void readVaultFile() throws IOException {
+        try (DataInputStream in = new DataInputStream(
+                new BufferedInputStream(new FileInputStream(filePath)))) {
+
+            // Read and verify format marker
+            byte[] markerBytes = new byte[formatMarker.length()];
+            in.readFully(markerBytes);
+            String marker = new String(markerBytes, StandardCharsets.US_ASCII);
+            if (!formatMarker.equals(marker)) {
+                throw new IOException("Invalid vault file format. "
+                        + "Expected marker '" + formatMarker + "' but found '" + marker + "'.");
+            }
+
+            // Read the three length-prefixed sections
+            this.salt          = readByteArray(in);
+            this.iv            = readByteArray(in);
+            this.encryptedData = readByteArray(in);
+        } catch (EOFException e) {
+            throw new IOException("Vault file is truncated or incomplete.", e);
+        }
+    }
+
+    /** Writes a length-prefixed byte array to the stream. */
+    private void writeByteArray(DataOutputStream out, byte[] data) throws IOException {
+        if (data == null) {
+            out.writeInt(-1);
+            return;
+        }
+        out.writeInt(data.length);
+        out.write(data);
+    }
+
+    /** Reads a length-prefixed byte array from the stream. */
+    private byte[] readByteArray(DataInputStream in) throws IOException {
+        int length = in.readInt();
+        if (length < 0 || length > 100_000_000) {
+            throw new IOException("Invalid byte array length in vault file: " + length);
+        }
+        byte[] data = new byte[length];
+        in.readFully(data);
+        return data;
+    }
+
+    /** Serializes a VaultData object to a byte array. */
+    private byte[] serializeVaultData(VaultData data) throws IOException {
+        try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
+             ObjectOutputStream oos = new ObjectOutputStream(baos)) {
+            oos.writeObject(data);
+            oos.flush();
+            return baos.toByteArray();
+        }
+    }
+
+    /** Deserializes a byte array back into a VaultData object. */
+    private VaultData deserializeVaultData(byte[] bytes)
+            throws IOException, ClassNotFoundException {
+        try (ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(bytes))) {
+            return (VaultData) ois.readObject();
+        }
+    }
+}
